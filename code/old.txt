@@ -1,0 +1,191 @@
+class WaveletSubbandMHSA2D(nn.Module):
+    def __init__(
+        self,
+        channels,
+        num_heads=4,
+        mlp_ratio=2.0,
+        dropout=0.0,
+        attention_axis="row",
+        patch_size=8,
+    ):
+        super().__init__()
+        if channels % 4 != 0:
+            raise ValueError(
+                f"Expected packed wavelet channels ({channels}) to be divisible by 4."
+            )
+
+        self.subband_channels = channels // 4
+        if self.subband_channels % num_heads != 0:
+            raise ValueError(
+                f"Expected subband channels ({self.subband_channels}) to be divisible by "
+                f"num_heads ({num_heads})."
+            )
+        if attention_axis not in {"row", "col"}:
+            raise ValueError(
+                f"Unsupported attention_axis: {attention_axis}. Expected 'row' or 'col'."
+            )
+        if patch_size <= 0:
+            raise ValueError(f"Expected patch_size > 0, but got {patch_size}.")
+
+        hidden_dim = int(channels * mlp_ratio)
+        self.channels = channels
+        self.subband_channels = channels // 4
+        self.high_freq_channels = self.subband_channels * 3
+        self.num_heads = num_heads
+        self.head_dim = self.high_freq_channels // num_heads
+        self.dropout = dropout
+        self.attention_axis = attention_axis
+        self.patch_size = patch_size
+
+        self.rotary_dim = (self.head_dim // 2) * 2
+        self._rope_cache = {}
+
+        self.q_norm = nn.LayerNorm(self.high_freq_channels)
+        self.kv_norm = nn.LayerNorm(self.subband_channels)
+        self.q_proj = nn.Linear(self.high_freq_channels, self.high_freq_channels)
+        self.kv_proj = nn.Linear(self.subband_channels, self.high_freq_channels * 2)
+        self.proj = nn.Linear(self.high_freq_channels, self.high_freq_channels)
+        self.proj_dropout = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(channels)
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, channels),
+            nn.Dropout(dropout),
+        )
+
+    def _reshape_to_axis_patches(self, tokens, height, width, channels):
+        batch_size = tokens.shape[0]
+
+        if self.attention_axis == "row":
+            if width % self.patch_size != 0:
+                raise ValueError(
+                    f"Expected width ({width}) to be divisible by patch_size ({self.patch_size}) "
+                    "for row-wise attention."
+                )
+            num_patches = width // self.patch_size
+            tokens = tokens.view(batch_size, height, width, channels)
+            tokens = tokens.view(batch_size, height, num_patches, self.patch_size, channels)
+            return tokens.reshape(batch_size * height * num_patches, self.patch_size, channels)
+
+        if height % self.patch_size != 0:
+            raise ValueError(
+                f"Expected height ({height}) to be divisible by patch_size ({self.patch_size}) "
+                "for column-wise attention."
+            )
+        num_patches = height // self.patch_size
+        tokens = tokens.view(batch_size, height, width, channels)
+        tokens = tokens.view(batch_size, num_patches, self.patch_size, width, channels)
+        tokens = tokens.permute(0, 3, 1, 2, 4)
+        return tokens.reshape(batch_size * width * num_patches, self.patch_size, channels)
+
+    def _reshape_from_axis_patches(self, tokens, batch_size, height, width, channels):
+        if self.attention_axis == "row":
+            num_patches = width // self.patch_size
+            tokens = tokens.view(batch_size, height, num_patches, self.patch_size, channels)
+            tokens = tokens.reshape(batch_size, height, width, channels)
+        else:
+            num_patches = height // self.patch_size
+            tokens = tokens.view(batch_size, width, num_patches, self.patch_size, channels)
+            tokens = tokens.permute(0, 2, 3, 1, 4).reshape(batch_size, height, width, channels)
+
+        return tokens.reshape(batch_size, height * width, channels)
+
+    def _get_rotary_position_table(self, batch_size, height, width, device, dtype):
+        if self.rotary_dim == 0:
+            return None, None
+
+        cache_key = (batch_size, height, width, device.type, device.index, dtype)
+        cached = self._rope_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if self.attention_axis == "row":
+            num_patches = width // self.patch_size
+            row_ids = torch.arange(height, device=device).view(1, height, 1)
+            patch_ids = torch.arange(num_patches, device=device).view(1, 1, num_patches)
+            patch_positions = row_ids * num_patches + patch_ids
+            patch_positions = patch_positions.expand(batch_size, height, num_patches)
+        else:
+            num_patches = height // self.patch_size
+            col_ids = torch.arange(width, device=device).view(1, width, 1)
+            patch_ids = torch.arange(num_patches, device=device).view(1, 1, num_patches)
+            patch_positions = col_ids * num_patches + patch_ids
+            patch_positions = patch_positions.expand(batch_size, width, num_patches)
+
+        patch_positions = patch_positions.reshape(-1).to(dtype=dtype)
+        token_offsets = torch.arange(self.patch_size, device=device, dtype=dtype)
+        rope_positions = patch_positions.unsqueeze(-1) * self.patch_size + token_offsets
+        inv_freq = 1.0 / (
+            10000 ** (torch.arange(0, self.rotary_dim, 2, device=device, dtype=dtype) / self.rotary_dim)
+        )
+        freqs = rope_positions.unsqueeze(-1) * inv_freq
+        cos = torch.repeat_interleave(freqs.cos(), 2, dim=-1).unsqueeze(1)
+        sin = torch.repeat_interleave(freqs.sin(), 2, dim=-1).unsqueeze(1)
+        self._rope_cache[cache_key] = (cos, sin)
+        return cos, sin
+
+    def _apply_rotary_position_encoding(self, x, cos, sin):
+        if cos is None or sin is None:
+            return x
+
+        x_rot = x[..., :self.rotary_dim]
+        x_pass = x[..., self.rotary_dim:]
+        x_even = x_rot[..., 0::2]
+        x_odd = x_rot[..., 1::2]
+        x_rotated = torch.stack((-x_odd, x_even), dim=-1).flatten(-2)
+        x_rot = (x_rot * cos) + (x_rotated * sin)
+
+        if x_pass.shape[-1] == 0:
+            return x_rot
+        return torch.cat([x_rot, x_pass], dim=-1)
+
+    def forward(self, x):
+        batch_size, channels, height, width = x.shape
+        hh, hl, lh, ll = torch.chunk(x, 4, dim=1)
+        high_freq = torch.cat([hh, hl, lh], dim=1)
+
+        high_tokens = high_freq.flatten(2).transpose(1, 2)
+        ll_tokens = ll.flatten(2).transpose(1, 2)
+        q_input = self._reshape_to_axis_patches(
+            self.q_norm(high_tokens), height, width, self.high_freq_channels
+        )
+        kv_input = self._reshape_to_axis_patches(
+            self.kv_norm(ll_tokens), height, width, self.subband_channels
+        )
+
+        q = self.q_proj(q_input)
+        k, v = self.kv_proj(kv_input).chunk(2, dim=-1)
+
+        q = q.view(-1, self.patch_size, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(-1, self.patch_size, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(-1, self.patch_size, self.num_heads, self.head_dim).transpose(1, 2)
+        rope_cos, rope_sin = self._get_rotary_position_table(
+            batch_size, height, width, q.device, q.dtype
+        )
+        q = self._apply_rotary_position_encoding(q, rope_cos, rope_sin)
+        k = self._apply_rotary_position_encoding(k, rope_cos, rope_sin)
+
+        attn_output = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        attn_output = attn_output.transpose(1, 2).contiguous().view(
+            -1, self.patch_size, self.high_freq_channels
+        )
+        attn_output = self.proj_dropout(self.proj(attn_output))
+        attn_output = self._reshape_from_axis_patches(
+            attn_output, batch_size, height, width, self.high_freq_channels
+        )
+        high_tokens = high_tokens + attn_output
+        high_freq = high_tokens.transpose(1, 2).reshape(
+            batch_size, self.high_freq_channels, height, width
+        )
+        hh, hl, lh = torch.chunk(high_freq, 3, dim=1)
+
+        tokens = torch.cat([hh, hl, lh, ll], dim=1).flatten(2).transpose(1, 2)
+        tokens = tokens + self.mlp(self.norm2(tokens))
+        return tokens.transpose(1, 2).reshape(batch_size, channels, height, width)

@@ -1,4 +1,5 @@
 import math
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -6,6 +7,24 @@ from complex.complex_layers import *
 from complex.complex_functions import *
 from complex.complex_module import *
 
+# 对输入的 ADC cube 仅做 FFT 变换，不做补零、旋转或裁剪，保持输入输出形状一致。
+# 若输入为 GPU tensor，则全程使用 torch.fft 在 GPU 上计算。
+def RAD_map(range_plot):
+    # 支持直接处理 torch.Tensor，避免 CUDA tensor 转 numpy 时报错。
+    if torch.is_tensor(range_plot):
+        # 沿 axis=0 做距离维 FFT。
+        range_fft = torch.fft.fft(range_plot, dim=0)
+        # 沿 axis=2 做多普勒维 FFT。
+        range_doppler_fft = torch.fft.fft(range_fft, dim=2)
+        # 将多普勒频谱移动到中心，但不改变张量形状。
+        out = torch.fft.fftshift(range_doppler_fft, dim=2)
+        return out
+
+    # 兼容 numpy 输入。
+    range_fft = np.fft.fft(range_plot, axis=0)
+    range_doppler_fft = np.fft.fft(range_fft, axis=2)
+    out = np.fft.fftshift(range_doppler_fft, axes=2)
+    return out
 
 def conv_block(in_chan, out_chan, stride=1):
     return nn.Sequential(
@@ -131,6 +150,10 @@ class Generator_radar3D_adc(nn.Module):
         self.block8 = nn.Sequential(*block8)
 
     def forward(self, x):
+        x_complex = torch.complex(x[:, 0], x[:, 1])
+        x_fft = RAD_map(x_complex)
+        X_out = torch.stack([x_fft.real, x_fft.imag], dim=1)
+        # x = torch.cat([x, X_out], dim=2)
         shape_buffer = x.shape
         block1 = self.block1(x)
         block2 = self.block2(block1)

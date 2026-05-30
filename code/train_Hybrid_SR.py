@@ -126,7 +126,7 @@ if __name__ == '__main__':
     
     train_set = TrainDatasetFromFolder_radar3D_adc(train_data_adc_dir, num_low_receiver, None, None, crop_size=CROP_SIZE, upscale_factor=UPSCALE_FACTOR,\
         index_list=1, num_high_receiver=num_high_receiver)
-    val_set = ValDatasetFromFolder_radar3D_adc(val_data_adc_dir, num_low_receiver, None, None, upscale_factor=UPSCALE_FACTOR, index_list=1,\
+    val_set = ValDatasetFromFolder_radar3D_adc(val_data_adc_dir, num_low_receiver, None, None, crop_size=CROP_SIZE, upscale_factor=UPSCALE_FACTOR, index_list=1,\
         num_high_receiver=num_high_receiver)
     train_loader = DataLoader(dataset=train_set, num_workers=4, batch_size=opt.batch_size, shuffle=True)
     val_loader = DataLoader(dataset=val_set, num_workers=4, batch_size=1, shuffle=False)
@@ -150,7 +150,7 @@ if __name__ == '__main__':
     # netD = Discriminator_radar()
     # print('# discriminator parameters:', sum(param.numel() for param in netD.parameters()))
     
-    generator_criterion = GeneratorLoss()
+    generator_criterion = GeneratorLoss(datamode="real")
     # generator_criterion = GeneratorLoss_L1()
     
     if torch.cuda.is_available():
@@ -274,8 +274,6 @@ if __name__ == '__main__':
         with torch.no_grad():
             val_bar = tqdm(val_loader) # batch size 1
             valing_results = {'mse': 0, 'ssims': 0, 'psnr': 0, 'ssim': 0, 'batch_sizes': 0}
-            val_images = []
-
             i = 0
             # for adc, adc_data_low, data, target in val_bar:
             for adc_hr, adc_lr, val_lr, val_hr in val_bar:
@@ -463,29 +461,9 @@ if __name__ == '__main__':
                 # range 0-1
                 # import pdb
                 # pdb.set_trace()
-                val_images.extend(
-                    [display_transform()(lr_img), display_transform()(hr_img),
-                     display_transform()(sr_img)])
-                
                 i+=1
                 if i>=5 and debug:
                     break
-               
-
-            # import pdb
-            # pdb.set_trace()
-            len_val = (len(val_images)//15)*15
-            val_images = val_images[:len_val]
-            val_images = torch.stack(val_images)
-            val_images = torch.chunk(val_images, val_images.size(0) // 15)
-            val_save_bar = tqdm(val_images, desc='[saving training results]')
-            index = 1
-            for image in val_save_bar:
-                # import pdb
-                # pdb.set_trace()
-                image = utils.make_grid(image, nrow=3, padding=5)
-                utils.save_image(image, out_path + 'epoch_%d_index_%d_%.4f.png' % (epoch, index, valing_results['mse_eval']), padding=5)
-                index += 1
     
         # save model parameters
         torch.save(netG.state_dict(), out_path + 'netG_epoch_%d.pth' % (epoch))

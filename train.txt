@@ -1,0 +1,4 @@
+ CUDA_VISIBLE_DEVICES=7 python train_ADC_SR.py --datamode complex --output /gly/czh/ComplexRadar/training_results/Complex_wavelet/ --train_data /gly/czh/Pitt-Radar/radar_numpy_train/ --val_data /gly/czh/Pitt-Radar/radar_numpy_test/
+
+
+python create_RAMap.py --model_name /home/neu/czh_code/Pitt-Radar/training_results/complex_0123_SR/netG_epoch_50.pth  --npy_path /home/neu/code/Pitt-Radar/radar_numpy_test --save_dir /home/neu/czh_code/Pitt-Radar/training_results/imference_image/complex_0123 --datamode complex
